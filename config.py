@@ -25,25 +25,25 @@ class UserConfig(BaseModel):
 # Each user can have multiple accounts
 USERS: List[UserConfig] = [
     UserConfig(
-        user_id="user1",
-        name="User 1",
-        username="USER",
-        password="PASSWORD",
+        user_id="CB4938",
+        name="CB4938",
+        username="CB4938",
+        password="Hayden2025@",
         host="127.0.0.1",
         port=9800,
         accounts=[
             AccountConfig(
-                account_id="account1",
-                name="Account 1",
-                account="ACCOUNT1",
+                account_id="TR4938",
+                name="TR4938",
+                account="TR4938",
                 enabled=True
             ),
-            AccountConfig(
-                account_id="account2",
-                name="Account 2",
-                account="ACCOUNT2",
-                enabled=True
-            ),
+            # AccountConfig(
+            #     account_id="account2",
+            #     name="Account 2",
+            #     account="ACCOUNT2",
+            #     enabled=True
+            # ),
             # Add more accounts for this user
         ]
     ),
@@ -75,4 +75,16 @@ for user in USERS:
         # Create a flattened account with user credentials and connection info
         flat_account = FlattenedAccount(account, user)
         ACCOUNTS.append(flat_account)
+
+# Authentication credentials (fixed for now)
+# In production, these should be stored securely (environment variables, secrets manager, etc.)
+AUTH_CREDENTIALS = {
+    "admin": "admin123",  # username: password
+    "user": "password123",
+}
+
+# JWT Secret key (in production, use a secure random key from environment variable)
+JWT_SECRET_KEY = "your-secret-key-change-this-in-production"
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRATION_HOURS = 24
 

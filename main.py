@@ -1,21 +1,24 @@
 """
 FastAPI Backend for DasTrader Dashboard
 """
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
 from typing import List, Dict, Optional
 import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
+from jose import JWTError, jwt
 
 try:
-    from .config import ACCOUNTS, ACCOUNTS_DICT, USERS
+    from .config import ACCOUNTS, ACCOUNTS_DICT, USERS, AUTH_CREDENTIALS, JWT_SECRET_KEY, JWT_ALGORITHM, JWT_EXPIRATION_HOURS
     from .das_connection import ConnectionManager, DasConnection
     from .data_parser import DataParser
 except ImportError:
-    from config import ACCOUNTS, ACCOUNTS_DICT, USERS
+    from config import ACCOUNTS, ACCOUNTS_DICT, USERS, AUTH_CREDENTIALS, JWT_SECRET_KEY, JWT_ALGORITHM, JWT_EXPIRATION_HOURS
     from das_connection import ConnectionManager, DasConnection
     from data_parser import DataParser
 
@@ -41,6 +44,46 @@ data_parser = DataParser()
 # Store latest data for each account
 account_data: Dict[str, Dict] = {}
 websocket_connections: List[WebSocket] = []
+
+# Authentication
+security = HTTPBearer()
+
+# Pydantic models for authentication
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    """Create JWT access token"""
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+    return encoded_jwt
+
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Verify JWT token"""
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        token = credentials.credentials
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+        return username
+    except JWTError:
+        raise credentials_exception
 
 
 @app.on_event("startup")
@@ -250,9 +293,32 @@ async def root():
     """Root endpoint"""
     return {"message": "DasTrader Dashboard API", "status": "running"}
 
+# Authentication endpoints (public)
+@app.post("/api/auth/login", response_model=TokenResponse)
+async def login(login_data: LoginRequest):
+    """Login endpoint - returns JWT token"""
+    username = login_data.username
+    password = login_data.password
+    
+    # Check credentials
+    if username not in AUTH_CREDENTIALS or AUTH_CREDENTIALS[username] != password:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    # Create access token
+    access_token = create_access_token(data={"sub": username})
+    return TokenResponse(access_token=access_token)
+
+@app.get("/api/auth/verify")
+async def verify_auth(current_user: str = Depends(verify_token)):
+    """Verify token endpoint"""
+    return {"username": current_user, "valid": True}
 
 @app.get("/api/accounts")
-async def get_accounts():
+async def get_accounts(current_user: str = Depends(verify_token)):
     """Get list of configured accounts grouped by user"""
     result = {
         "users": [],
@@ -290,7 +356,7 @@ async def get_accounts():
 
 
 @app.get("/api/accounts/{account_id}/positions")
-async def get_positions(account_id: str):
+async def get_positions(account_id: str, current_user: str = Depends(verify_token)):
     """Get positions for an account"""
     if account_id not in account_data:
         raise HTTPException(status_code=404, detail="Account not found")
@@ -315,7 +381,7 @@ async def get_positions(account_id: str):
 
 
 @app.get("/api/accounts/{account_id}/orders")
-async def get_orders(account_id: str):
+async def get_orders(account_id: str, current_user: str = Depends(verify_token)):
     """Get orders for an account"""
     if account_id not in account_data:
         raise HTTPException(status_code=404, detail="Account not found")
@@ -323,7 +389,7 @@ async def get_orders(account_id: str):
 
 
 @app.get("/api/accounts/{account_id}/trades")
-async def get_trades(account_id: str, limit: int = 100):
+async def get_trades(account_id: str, limit: int = 100, current_user: str = Depends(verify_token)):
     """Get recent trades for an account"""
     if account_id not in account_data:
         raise HTTPException(status_code=404, detail="Account not found")
@@ -332,7 +398,7 @@ async def get_trades(account_id: str, limit: int = 100):
 
 
 @app.get("/api/accounts/{account_id}/overview")
-async def get_account_overview(account_id: str):
+async def get_account_overview(account_id: str, current_user: str = Depends(verify_token)):
     """Get account overview (equity, margin, cash, etc.)"""
     if account_id not in account_data:
         raise HTTPException(status_code=404, detail="Account not found")
@@ -367,7 +433,7 @@ async def get_account_overview(account_id: str):
 
 
 @app.get("/api/accounts/{account_id}/activity")
-async def get_activity(account_id: str, limit: int = 100):
+async def get_activity(account_id: str, limit: int = 100, current_user: str = Depends(verify_token)):
     """Get activity log (trades, order actions, etc.)"""
     if account_id not in account_data:
         raise HTTPException(status_code=404, detail="Account not found")
@@ -394,7 +460,7 @@ async def get_activity(account_id: str, limit: int = 100):
 
 
 @app.post("/api/accounts/{account_id}/refresh")
-async def refresh_account_data(account_id: str):
+async def refresh_account_data(account_id: str, current_user: str = Depends(verify_token)):
     """Manually refresh account data"""
     conn = connection_manager.get_connection(account_id)
     if not conn:
