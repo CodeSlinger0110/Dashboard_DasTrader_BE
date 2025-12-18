@@ -241,46 +241,62 @@ async def broadcast_update(account_id: str, update_type: str, data: Dict):
             websocket_connections.remove(ws)
 
 
+async def update_account_data(account_id: str, conn: DasConnection):
+    """Update data for a single account"""
+    if not conn.connected:
+        return
+    
+    try:
+        # Run all commands in parallel for faster updates
+        pos_task = conn.send_command("GET POSITIONS")
+        order_task = conn.send_command("GET ORDERS")
+        acc_task = conn.send_command("GET AccountInfo")
+        bp_task = conn.send_command("GET BP")
+        
+        # Wait for all commands to complete
+        pos_data, order_data, acc_data, bp_data = await asyncio.gather(
+            pos_task, order_task, acc_task, bp_task,
+            return_exceptions=True
+        )
+        
+        # Process results
+        if account_id in account_data:
+            if pos_data and not isinstance(pos_data, Exception):
+                positions = data_parser.parse_positions(pos_data)
+                account_data[account_id]["positions"] = positions
+            
+            if order_data and not isinstance(order_data, Exception):
+                orders = data_parser.parse_orders(order_data)
+                account_data[account_id]["orders"] = orders
+            
+            if acc_data and not isinstance(acc_data, Exception):
+                info = data_parser.parse_account_info(acc_data)
+                if info:
+                    account_data[account_id]["account_info"] = info
+            
+            if bp_data and not isinstance(bp_data, Exception):
+                bp = data_parser.parse_buying_power(bp_data)
+                if bp:
+                    account_data[account_id]["buying_power"] = bp
+            
+            account_data[account_id]["last_update"] = datetime.now().isoformat()
+    except Exception as e:
+        logger.error(f"Error updating {account_id}: {e}")
+
+
 async def periodic_updates():
     """Periodic updates for positions, orders, account info"""
     while True:
         try:
+            # Update all accounts in parallel for better performance
+            update_tasks = []
             for account_id, conn in connection_manager.get_all_connections().items():
-                if not conn.connected:
-                    continue
-                
-                try:
-                    # Refresh positions
-                    pos_data = await conn.send_command("GET POSITIONS")
-                    if pos_data:
-                        positions = data_parser.parse_positions(pos_data)
-                        if account_id in account_data:
-                            account_data[account_id]["positions"] = positions
-                    
-                    # Refresh orders
-                    order_data = await conn.send_command("GET ORDERS")
-                    if order_data:
-                        orders = data_parser.parse_orders(order_data)
-                        if account_id in account_data:
-                            account_data[account_id]["orders"] = orders
-                    
-                    # Refresh account info
-                    acc_data = await conn.send_command("GET AccountInfo")
-                    if acc_data:
-                        info = data_parser.parse_account_info(acc_data)
-                        if info and account_id in account_data:
-                            account_data[account_id]["account_info"] = info
-                    
-                    # Refresh buying power
-                    bp_data = await conn.send_command("GET BP")
-                    if bp_data:
-                        bp = data_parser.parse_buying_power(bp_data)
-                        if bp and account_id in account_data:
-                            account_data[account_id]["buying_power"] = bp
-                    
-                    account_data[account_id]["last_update"] = datetime.now().isoformat()
-                except Exception as e:
-                    logger.error(f"Error updating {account_id}: {e}")
+                if conn.connected:
+                    update_tasks.append(update_account_data(account_id, conn))
+            
+            # Wait for all updates to complete
+            if update_tasks:
+                await asyncio.gather(*update_tasks, return_exceptions=True)
             
             await asyncio.sleep(5)  # Update every 5 seconds
         except Exception as e:
