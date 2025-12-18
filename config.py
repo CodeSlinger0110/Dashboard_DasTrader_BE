@@ -25,26 +25,79 @@ class UserConfig(BaseModel):
 # Each user can have multiple accounts
 USERS: List[UserConfig] = [
     UserConfig(
-        user_id="CB4938",
-        name="CB4938",
-        username="CB4938",
-        password="Hayden2025@",
-        host="127.0.0.1",
-        port=9800,
+        user_id="CB4507",
+        name="CB4507",
+        username="CB4507",
+        password="DSJ23100M!",
+        host="155.94.150.127",
+        port=9805,
         accounts=[
             AccountConfig(
-                account_id="TR4938",
-                name="TR4938",
-                account="TR4938",
+                account_id="TR4507",
+                name="TR4507",
+                account="TR4507",
                 enabled=True
             ),
-            # AccountConfig(
-            #     account_id="account2",
-            #     name="Account 2",
-            #     account="ACCOUNT2",
-            #     enabled=True
-            # ),
-            # Add more accounts for this user
+            AccountConfig(
+                account_id="1RB13972",
+                name="1RB13972",
+                account="1RB13972",
+                enabled=True
+            ),
+        ]
+    ),
+    UserConfig(
+        user_id="Cb4939",
+        name="Cb4939",
+        username="Cb4939",
+        password="Hayden2025@",
+        host="155.94.150.127",
+        port=9803,
+        accounts=[
+            AccountConfig(
+                account_id="TR4939",
+                name="TR4939",
+                account="TR4939",
+                enabled=True
+            ),
+            AccountConfig(
+                account_id="1RB14079",
+                name="1RB14079",
+                account="1RB14079",
+                enabled=True
+            ),
+        ]
+    ),
+    UserConfig(
+        user_id="CB4960",
+        name="CB4960",
+        username="CB4960",
+        password="Hayden2026@",
+        host="155.94.150.127",
+        port=9810,
+        accounts=[
+            AccountConfig(
+                account_id="1RB14089",
+                name="1RB14089",
+                account="1RB14089",
+                enabled=True
+            ),
+        ]
+    ),
+    UserConfig(
+        user_id="CB4954",
+        name="CB4954",
+        username="CB4954",
+        password="Hayden2025@",
+        host="155.94.150.127",
+        port=9801,
+        accounts=[
+            AccountConfig(
+                account_id="TR4954",
+                name="TR4954",
+                account="TR4954",
+                enabled=True
+            ),
         ]
     ),
 ]

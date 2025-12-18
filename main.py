@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import List, Dict, Optional
+from contextlib import asynccontextmanager
 import asyncio
 import json
 import logging
@@ -26,17 +27,6 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="DasTrader Dashboard API")
-
-# CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # In production, specify your frontend URL
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # Global connection manager
 connection_manager = ConnectionManager()
 data_parser = DataParser()
@@ -45,50 +35,11 @@ data_parser = DataParser()
 account_data: Dict[str, Dict] = {}
 websocket_connections: List[WebSocket] = []
 
-# Authentication
-security = HTTPBearer()
 
-# Pydantic models for authentication
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
-class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    """Create JWT access token"""
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
-    return encoded_jwt
-
-async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Verify JWT token"""
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    try:
-        token = credentials.credentials
-        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
-            raise credentials_exception
-        return username
-    except JWTError:
-        raise credentials_exception
-
-
-@app.on_event("startup")
-async def startup():
-    """Initialize connections on startup"""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup and shutdown events"""
+    # Startup
     logger.info("Starting up...")
     # Initialize connections from config
     # Each account gets credentials and connection info from its parent user
@@ -129,13 +80,64 @@ async def startup():
     
     # Start background update tasks
     asyncio.create_task(periodic_updates())
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    """Cleanup on shutdown"""
+    
+    yield
+    
+    # Shutdown
     logger.info("Shutting down...")
     await connection_manager.disconnect_all()
+
+
+app = FastAPI(title="DasTrader Dashboard API", lifespan=lifespan)
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, specify your frontend URL
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Authentication
+security = HTTPBearer()
+
+# Pydantic models for authentication
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    """Create JWT access token"""
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+    return encoded_jwt
+
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Verify JWT token"""
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        token = credentials.credentials
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+        return username
+    except JWTError:
+        raise credentials_exception
 
 
 async def handle_position_update(account_id: str, data: str):
@@ -492,6 +494,52 @@ async def refresh_account_data(account_id: str, current_user: str = Depends(veri
         
         return {"status": "success", "message": "Data refreshed"}
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/accounts/{account_id}/reconnect")
+async def reconnect_account(account_id: str, current_user: str = Depends(verify_token)):
+    """Retry connection for a specific account"""
+    conn = connection_manager.get_connection(account_id)
+    if not conn:
+        raise HTTPException(status_code=404, detail="Account not found")
+    
+    try:
+        # Disconnect if currently connected
+        if conn.connected:
+            await conn.disconnect()
+        
+        # Attempt to reconnect
+        success = await conn.connect()
+        
+        if success:
+            # Re-register callbacks if needed
+            conn.register_callback("position", handle_position_update)
+            conn.register_callback("order", handle_order_update)
+            conn.register_callback("trade", handle_trade_update)
+            conn.register_callback("account", handle_account_update)
+            conn.register_callback("quote", handle_quote_update)
+            
+            # Broadcast connection status update
+            await broadcast_update(account_id, "connection_status", {"connected": True})
+            
+            return {
+                "status": "success",
+                "message": "Account reconnected successfully",
+                "connected": True
+            }
+        else:
+            error_msg = conn.last_error or "Connection failed"
+            await broadcast_update(account_id, "connection_status", {"connected": False, "error": error_msg})
+            
+            return {
+                "status": "error",
+                "message": f"Failed to reconnect: {error_msg}",
+                "connected": False,
+                "error": error_msg
+            }
+    except Exception as e:
+        logger.error(f"Reconnect error for {account_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
