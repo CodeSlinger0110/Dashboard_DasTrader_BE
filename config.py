@@ -23,6 +23,7 @@ class UserConfig(BaseModel):
 
 # Configure users and their accounts here
 # Each user can have multiple accounts
+# CB4507 - Hayden
 USERS: List[UserConfig] = [
     UserConfig(
         user_id="CB4507",
@@ -101,7 +102,6 @@ USERS: List[UserConfig] = [
         ]
     ),
 ]
-
 # Flatten accounts list for backward compatibility and easier access
 # Format: {account_id: (user_config, account_config)}
 ACCOUNTS_DICT: Dict[str, tuple] = {}
