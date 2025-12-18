@@ -29,26 +29,72 @@ class DasConnection:
         self.reader_paused = False  # Flag to pause background reader during commands
         
     async def connect(self) -> bool:
-        """Connect to DasTrader server"""
+        """Connect to DasTrader server with fast timeout"""
         try:
             # Use asyncio to make socket operations non-blocking
             loop = asyncio.get_event_loop()
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.settimeout(2)  # Reduced timeout from 5 to 2 seconds
             self.socket.setblocking(False)  # Make non-blocking
             
-            # Connect using asyncio
-            await loop.sock_connect(self.socket, (self.host, self.port))
-            await asyncio.sleep(0.05)  # Reduced from 0.1
+            # Connect with short timeout (1 second) to fail fast
+            try:
+                await asyncio.wait_for(
+                    loop.sock_connect(self.socket, (self.host, self.port)),
+                    timeout=1.0  # 1 second timeout for connection
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"Connection timeout for {self.account_id} ({self.host}:{self.port}) - DasTrader may not be running")
+                self.connected = False
+                self.last_error = f"Connection timeout - DasTrader may not be running on {self.host}:{self.port}"
+                if self.socket:
+                    try:
+                        self.socket.close()
+                    except:
+                        pass
+                    self.socket = None
+                return False
+            except OSError as e:
+                # Handle connection refused, network unreachable, etc.
+                error_msg = f"Connection failed: {e}"
+                logger.warning(f"Connection failed for {self.account_id} ({self.host}:{self.port}) - {error_msg}")
+                self.connected = False
+                self.last_error = error_msg
+                if self.socket:
+                    try:
+                        self.socket.close()
+                    except:
+                        pass
+                    self.socket = None
+                return False
             
-            # Login
-            login_data = f"LOGIN {self.user} {self.password} {self.account}\r\n"
-            await loop.sock_sendall(self.socket, login_data.encode("ascii"))
-            await asyncio.sleep(0.05)  # Reduced from 0.1
+            await asyncio.sleep(0.05)
             
-            # Read login response
-            response = await self.recvall_async()
-            logger.info(f"Login response for {self.account_id}: {response[:200]}")
+            # Login with timeout
+            try:
+                login_data = f"LOGIN {self.user} {self.password} {self.account}\r\n"
+                await asyncio.wait_for(
+                    loop.sock_sendall(self.socket, login_data.encode("ascii")),
+                    timeout=0.5  # 500ms timeout for login send
+                )
+                await asyncio.sleep(0.05)
+                
+                # Read login response with timeout
+                response = await asyncio.wait_for(
+                    self.recvall_async(timeout=0.5),
+                    timeout=0.5  # 500ms timeout for login response
+                )
+                logger.info(f"Login response for {self.account_id}: {response[:200]}")
+            except asyncio.TimeoutError:
+                logger.warning(f"Login timeout for {self.account_id} - server may be slow or unresponsive")
+                self.connected = False
+                self.last_error = "Login timeout"
+                if self.socket:
+                    try:
+                        self.socket.close()
+                    except:
+                        pass
+                    self.socket = None
+                return False
             
             self.connected = True
             self.last_error = None
@@ -261,10 +307,47 @@ class ConnectionManager:
         return conn
     
     async def connect_all(self):
-        """Connect to all enabled accounts"""
+        """Connect to all enabled accounts in parallel with fast failure"""
+        # Connect to all accounts in parallel for faster startup
+        async def connect_account(account_id: str, conn: DasConnection):
+            try:
+                result = await conn.connect()
+                return account_id, result
+            except Exception as e:
+                logger.error(f"Unexpected error connecting {account_id}: {e}")
+                return account_id, False
+        
+        # Create tasks for all connections
+        tasks = [
+            connect_account(account_id, conn)
+            for account_id, conn in self.connections.items()
+        ]
+        
+        # Wait for all connections with a reasonable timeout (5 seconds total)
+        try:
+            results_list = await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=5.0  # Maximum 5 seconds for all connections
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Connection timeout - some accounts may still be connecting")
+            results_list = []
+        
+        # Convert to dictionary
         results = {}
-        for account_id, conn in self.connections.items():
-            results[account_id] = await conn.connect()
+        for item in results_list:
+            if isinstance(item, Exception):
+                logger.error(f"Connection task error: {item}")
+                continue
+            if isinstance(item, tuple) and len(item) == 2:
+                account_id, success = item
+                results[account_id] = success
+        
+        # Log summary
+        successful = sum(1 for v in results.values() if v)
+        failed = len(results) - successful
+        logger.info(f"Connection summary: {successful} successful, {failed} failed")
+        
         return results
     
     async def disconnect_all(self):
