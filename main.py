@@ -311,6 +311,16 @@ async def root():
     """Root endpoint"""
     return {"message": "DasTrader Dashboard API", "status": "running"}
 
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "websocket_endpoint": "/ws",
+        "connected_accounts": len([acc for acc in account_data.keys()]),
+        "active_websocket_connections": len(websocket_connections)
+    }
+
 # Authentication endpoints (public)
 @app.post("/api/auth/login", response_model=TokenResponse)
 async def login(login_data: LoginRequest):
@@ -563,10 +573,13 @@ async def reconnect_account(account_id: str, current_user: str = Depends(verify_
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """WebSocket endpoint for real-time updates"""
-    await websocket.accept()
-    websocket_connections.append(websocket)
-    
     try:
+        # Accept connection with origin check disabled (handled by reverse proxy)
+        await websocket.accept()
+        client_info = f"{websocket.client.host}:{websocket.client.port}" if websocket.client else "unknown"
+        logger.info(f"WebSocket connection accepted from {client_info}")
+        websocket_connections.append(websocket)
+        
         # Send initial data
         for account_id in account_data.keys():
             await websocket.send_json({
@@ -583,12 +596,17 @@ async def websocket_endpoint(websocket: WebSocket):
                 if data == "ping":
                     await websocket.send_json({"type": "pong"})
             except WebSocketDisconnect:
+                logger.info(f"WebSocket disconnected: {websocket.client}")
                 break
     except WebSocketDisconnect:
+        logger.info(f"WebSocket disconnected during accept: {websocket.client}")
         pass
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
     finally:
         if websocket in websocket_connections:
             websocket_connections.remove(websocket)
+            logger.info(f"WebSocket removed from connections list")
 
 
 if __name__ == "__main__":
