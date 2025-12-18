@@ -23,9 +23,17 @@ except ImportError:
     from das_connection import ConnectionManager, DasConnection
     from data_parser import DataParser
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
+# Setup logging with detailed format
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 logger = logging.getLogger(__name__)
+
+# Set uvicorn access logger to show more details
+uvicorn_logger = logging.getLogger("uvicorn.access")
+uvicorn_logger.setLevel(logging.INFO)
 
 # Global connection manager
 connection_manager = ConnectionManager()
@@ -250,24 +258,38 @@ async def update_account_data(account_id: str, conn: DasConnection):
         # Run all commands in parallel for faster updates
         pos_task = conn.send_command("GET POSITIONS")
         order_task = conn.send_command("GET ORDERS")
+        trade_task = conn.send_command("GET TRADES")
         acc_task = conn.send_command("GET AccountInfo")
         bp_task = conn.send_command("GET BP")
         
         # Wait for all commands to complete
-        pos_data, order_data, acc_data, bp_data = await asyncio.gather(
-            pos_task, order_task, acc_task, bp_task,
+        pos_data, order_data, trade_data, acc_data, bp_data = await asyncio.gather(
+            pos_task, order_task, trade_task, acc_task, bp_task,
             return_exceptions=True
         )
         
         # Process results
         if account_id in account_data:
+            # Process positions
             if pos_data and not isinstance(pos_data, Exception):
                 positions = data_parser.parse_positions(pos_data)
                 account_data[account_id]["positions"] = positions
+            elif isinstance(pos_data, Exception):
+                logger.error(f"[{account_id}] Error fetching positions: {pos_data}")
             
+            # Process orders
             if order_data and not isinstance(order_data, Exception):
                 orders = data_parser.parse_orders(order_data)
                 account_data[account_id]["orders"] = orders
+            elif isinstance(order_data, Exception):
+                logger.error(f"[{account_id}] Error fetching orders: {order_data}")
+            
+            # Process trades
+            if trade_data and not isinstance(trade_data, Exception):
+                trades = data_parser.parse_trades(trade_data)
+                account_data[account_id]["trades"] = trades
+            elif isinstance(trade_data, Exception):
+                logger.error(f"[{account_id}] Error fetching trades: {trade_data}")
             
             if acc_data and not isinstance(acc_data, Exception):
                 info = data_parser.parse_account_info(acc_data)
@@ -389,21 +411,34 @@ async def get_positions(account_id: str, current_user: str = Depends(verify_toke
     if account_id not in account_data:
         raise HTTPException(status_code=404, detail="Account not found")
     
-    # Calculate current mark price and unrealized PnL from quotes
-    positions = account_data[account_id]["positions"].copy()
-    quotes = account_data[account_id]["quotes"]
+    # Get positions safely - handle None or empty list
+    positions_raw = account_data[account_id].get("positions")
     
+    if not positions_raw or not isinstance(positions_raw, list):
+        return {"account_id": account_id, "positions": []}
+    
+    # Filter out positions with zero quantity (closed positions)
+    positions = [pos.copy() for pos in positions_raw if isinstance(pos, dict) and pos.get("quantity", 0) != 0]
+    
+    quotes = account_data[account_id].get("quotes", {})
+    
+    # Calculate current mark price and unrealized PnL from quotes
     for pos in positions:
-        symbol = pos["symbol"]
-        if symbol in quotes:
+        if not isinstance(pos, dict):
+            continue
+        symbol = pos.get("symbol")
+        if symbol and symbol in quotes:
             quote = quotes[symbol]
-            mark_price = quote.get("l", pos["avg_cost"])  # Use last price as mark
-            pos["mark_price"] = mark_price
-            # Recalculate unrealized PnL
-            if pos["type"] == "short":
-                pos["unrealized_pnl"] = (pos["avg_cost"] - mark_price) * pos["quantity"]
-            else:
-                pos["unrealized_pnl"] = (mark_price - pos["avg_cost"]) * pos["quantity"]
+            if isinstance(quote, dict):
+                mark_price = quote.get("l", pos.get("avg_cost", 0))
+                pos["mark_price"] = mark_price
+                # Recalculate unrealized PnL
+                quantity = pos.get("quantity", 0)
+                avg_cost = pos.get("avg_cost", 0)
+                if pos.get("type") == "short":
+                    pos["unrealized_pnl"] = (avg_cost - mark_price) * quantity
+                else:
+                    pos["unrealized_pnl"] = (mark_price - avg_cost) * quantity
     
     return {"account_id": account_id, "positions": positions}
 
@@ -413,7 +448,17 @@ async def get_orders(account_id: str, current_user: str = Depends(verify_token))
     """Get orders for an account"""
     if account_id not in account_data:
         raise HTTPException(status_code=404, detail="Account not found")
-    return {"account_id": account_id, "orders": account_data[account_id]["orders"]}
+    
+    # Get orders safely - handle None or empty list
+    orders_raw = account_data[account_id].get("orders")
+    
+    if not orders_raw or not isinstance(orders_raw, list):
+        return {"account_id": account_id, "orders": []}
+    
+    # Filter out invalid orders and ensure they're dictionaries
+    orders = [order for order in orders_raw if isinstance(order, dict)]
+    
+    return {"account_id": account_id, "orders": orders}
 
 
 @app.get("/api/accounts/{account_id}/trades")
@@ -421,7 +466,13 @@ async def get_trades(account_id: str, limit: int = 100, current_user: str = Depe
     """Get recent trades for an account"""
     if account_id not in account_data:
         raise HTTPException(status_code=404, detail="Account not found")
-    trades = account_data[account_id]["trades"][:limit]
+    
+    trades_raw = account_data[account_id].get("trades")
+    
+    if not trades_raw or not isinstance(trades_raw, list):
+        return {"account_id": account_id, "trades": []}
+    
+    trades = [trade for trade in trades_raw if isinstance(trade, dict)][:limit]
     return {"account_id": account_id, "trades": trades}
 
 
@@ -479,17 +530,21 @@ async def get_activity(account_id: str, limit: int = 100, current_user: str = De
     activities = []
     
     # Add trades
-    for trade in account_data[account_id]["trades"][:limit]:
-        activities.append({
-            "type": "trade",
-            "timestamp": trade.get("time", ""),
-            "symbol": trade["symbol"],
-            "side": trade["side"],
-            "quantity": trade["quantity"],
-            "price": trade["price"],
-            "realized_pl": trade.get("realized_pl", 0),
-            "data": trade
-        })
+    trades_raw = account_data[account_id].get("trades")
+    
+    if trades_raw and isinstance(trades_raw, list):
+        for trade in trades_raw[:limit * 2]:  # Get more to sort, then limit
+            if isinstance(trade, dict):
+                activities.append({
+                    "type": "trade",
+                    "timestamp": trade.get("time", ""),
+                    "symbol": trade.get("symbol", ""),
+                    "side": trade.get("side", ""),
+                    "quantity": trade.get("quantity", 0),
+                    "price": trade.get("price", 0),
+                    "realized_pl": trade.get("realized_pl", 0),
+                    "data": trade
+                })
     
     # Sort by timestamp (most recent first)
     activities.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
@@ -621,5 +676,44 @@ async def websocket_endpoint(websocket: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Configure uvicorn logging to show all logs
+    log_config = {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "default": {
+                "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+                "datefmt": "%Y-%m-%d %H:%M:%S"
+            },
+            "access": {
+                "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+                "datefmt": "%Y-%m-%d %H:%M:%S"
+            }
+        },
+        "handlers": {
+            "default": {
+                "formatter": "default",
+                "class": "logging.StreamHandler",
+                "stream": "ext://sys.stdout"
+            },
+            "access": {
+                "formatter": "access",
+                "class": "logging.StreamHandler",
+                "stream": "ext://sys.stdout"
+            }
+        },
+        "loggers": {
+            "": {"handlers": ["default"], "level": "INFO"},
+            "uvicorn": {"handlers": ["default"], "level": "INFO"},
+            "uvicorn.error": {"handlers": ["default"], "level": "INFO"},
+            "uvicorn.access": {"handlers": ["access"], "level": "INFO"}
+        }
+    }
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=8000,
+        log_config=log_config,
+        log_level="info"
+    )
 

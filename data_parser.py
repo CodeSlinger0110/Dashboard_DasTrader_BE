@@ -2,8 +2,11 @@
 Parser for DasTrader CMD API responses
 """
 import re
+import logging
 from typing import List, Dict, Optional
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 try:
     from .constants import (
         MARKER_POS_START, MARKER_POS_END,
@@ -31,16 +34,24 @@ class DataParser:
         
         for line in lines:
             line = line.strip()
+            # Check for exact start marker
             if line == MARKER_POS_START:
                 in_positions = True
                 continue
+            # Check for end marker
             if line == MARKER_POS_END:
-                break
-            if in_positions and line.startswith("%POS"):
+                # Don't break - continue to parse any remaining positions
+                continue
+            # Parse %POS lines - if we see positions, assume we're in positions section
+            if line.startswith("%POS"):
+                # If we haven't seen start marker but we see positions, assume we're in positions section
+                if not in_positions:
+                    in_positions = True
                 pos = DataParser._parse_position_line(line)
                 if pos:
                     positions.append(pos)
-        
+                else:
+                    logger.warning(f"Failed to parse position line: {line[:100]}")
         return positions
     
     @staticmethod
@@ -48,8 +59,9 @@ class DataParser:
         """Parse a single %POS line"""
         try:
             # Format: %POS Symbol Type Quantity AvgCost InitQuantity InitPrice Realized CreateTime Unrealized
+            # That's %POS (1) + 9 fields = 10 parts minimum
             parts = line.split()
-            if len(parts) < 9:
+            if len(parts) < 10:
                 return None
             
             pos_type_map = {
@@ -70,7 +82,7 @@ class DataParser:
                 "unrealized_pnl": float(parts[9]) if len(parts) > 9 else 0.0
             }
         except Exception as e:
-            print(f"Error parsing position line: {e}")
+            logger.warning(f"Error parsing position line: {e}")
             return None
     
     @staticmethod
@@ -82,16 +94,24 @@ class DataParser:
         
         for line in lines:
             line = line.strip()
-            if line.startswith(MARKER_ORDER_START):
+            # Check for exact start marker (exclude #OrderEnd which also starts with "#Order")
+            if line == MARKER_ORDER_START:
                 in_orders = True
                 continue
+            # Check for end marker first (before checking for %ORDER lines)
             if line == MARKER_ORDER_END:
-                break
-            if in_orders and line.startswith("%ORDER"):
+                # Don't break - continue to parse any remaining orders before the end
+                continue
+            # Parse %ORDER lines - if we see orders, assume we're in orders section
+            if line.startswith("%ORDER"):
+                # If we haven't seen start marker but we see orders, assume we're in orders section
+                if not in_orders:
+                    in_orders = True
                 order = DataParser._parse_order_line(line)
                 if order:
                     orders.append(order)
-        
+                else:
+                    logger.warning(f"Failed to parse order line: {line[:100]}")
         return orders
     
     @staticmethod
@@ -128,7 +148,7 @@ class DataParser:
                 "order_source": parts[16] if len(parts) > 16 else ""
             }
         except Exception as e:
-            print(f"Error parsing order line: {e}")
+            logger.warning(f"Error parsing order line: {e}")
             return None
     
     @staticmethod
@@ -140,16 +160,24 @@ class DataParser:
         
         for line in lines:
             line = line.strip()
-            if line.startswith(MARKER_TRADE_START):
+            # Check for exact start marker (not just startsWith to avoid matching #TradeEnd)
+            if line == MARKER_TRADE_START:
                 in_trades = True
                 continue
+            # Check for end marker
             if line == MARKER_TRADE_END:
-                break
-            if in_trades and line.startswith("%TRADE"):
+                # Don't break - continue to parse any remaining trades
+                continue
+            # Parse %TRADE lines - if we see trades, assume we're in trades section
+            if line.startswith("%TRADE"):
+                # If we haven't seen start marker but we see trades, assume we're in trades section
+                if not in_trades:
+                    in_trades = True
                 trade = DataParser._parse_trade_line(line)
                 if trade:
                     trades.append(trade)
-        
+                else:
+                    logger.warning(f"Failed to parse trade line: {line[:100]}")
         return trades
     
     @staticmethod
