@@ -432,30 +432,40 @@ async def get_account_overview(account_id: str, current_user: str = Depends(veri
         raise HTTPException(status_code=404, detail="Account not found")
     
     data = account_data[account_id]
-    account_info = data.get("account_info", {})
-    buying_power = data.get("buying_power", {})
+    # Handle None values - if account_info or buying_power is None, use empty dict
+    account_info = data.get("account_info") or {}
+    buying_power = data.get("buying_power") or {}
     positions = data.get("positions", [])
     
     # Calculate total unrealized PnL
-    total_unrealized = sum(p.get("unrealized_pnl", 0) for p in positions)
+    total_unrealized = sum(p.get("unrealized_pnl", 0) for p in positions if isinstance(p, dict))
     
     # Calculate exposure by asset class (simplified - all equities for now)
-    equity_exposure = sum(abs(p["quantity"] * p.get("mark_price", p["avg_cost"])) for p in positions)
+    equity_exposure = sum(
+        abs(p.get("quantity", 0) * p.get("mark_price", p.get("avg_cost", 0))) 
+        for p in positions 
+        if isinstance(p, dict)
+    )
+    
+    # Safely get account info values with defaults
+    sec_fee = account_info.get("sec_fee", 0) if isinstance(account_info, dict) else 0
+    finra_fee = account_info.get("finra_fee", 0) if isinstance(account_info, dict) else 0
+    ecn_fee = account_info.get("ecn_fee", 0) if isinstance(account_info, dict) else 0
     
     return {
         "account_id": account_id,
         "user_id": data.get("user_id"),
         "user_name": data.get("user_name"),
-        "current_equity": account_info.get("current_equity", 0),
-        "open_equity": account_info.get("open_equity", 0),
-        "realized_pl": account_info.get("realized_pl", 0),
+        "current_equity": account_info.get("current_equity", 0) if isinstance(account_info, dict) else 0,
+        "open_equity": account_info.get("open_equity", 0) if isinstance(account_info, dict) else 0,
+        "realized_pl": account_info.get("realized_pl", 0) if isinstance(account_info, dict) else 0,
         "unrealized_pl": total_unrealized,
-        "net_pl": account_info.get("net_pl", 0),
-        "buying_power": buying_power.get("current_bp", 0),
-        "overnight_bp": buying_power.get("overnight_bp", 0),
+        "net_pl": account_info.get("net_pl", 0) if isinstance(account_info, dict) else 0,
+        "buying_power": buying_power.get("current_bp", 0) if isinstance(buying_power, dict) else 0,
+        "overnight_bp": buying_power.get("overnight_bp", 0) if isinstance(buying_power, dict) else 0,
         "equity_exposure": equity_exposure,
-        "commission": account_info.get("commission", 0),
-        "fees": account_info.get("sec_fee", 0) + account_info.get("finra_fee", 0) + account_info.get("ecn_fee", 0),
+        "commission": account_info.get("commission", 0) if isinstance(account_info, dict) else 0,
+        "fees": sec_fee + finra_fee + ecn_fee,
         "last_update": data.get("last_update")
     }
 
