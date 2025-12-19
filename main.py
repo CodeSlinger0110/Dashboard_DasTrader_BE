@@ -86,8 +86,19 @@ async def lifespan(app: FastAPI):
     # Connect to all accounts
     await connection_manager.connect_all()
     
-    # Start background update tasks
-    asyncio.create_task(periodic_updates())
+    # Fetch initial data for all connected accounts (one-time fetch on startup)
+    logger.info("Fetching initial data for all connected accounts...")
+    initial_tasks = []
+    for account_id, conn in connection_manager.get_all_connections().items():
+        if conn.connected:
+            initial_tasks.append(update_account_data(account_id, conn))
+    
+    if initial_tasks:
+        await asyncio.gather(*initial_tasks, return_exceptions=True)
+        logger.info("Initial data fetch completed")
+    
+    # Note: Periodic updates disabled - data is refreshed manually via refresh button
+    # Real-time updates still work via WebSocket callbacks from DasTrader
     
     yield
     
@@ -194,10 +205,21 @@ async def handle_trade_update(account_id: str, data: str):
     """Handle trade update"""
     trade = data_parser._parse_trade_line(data)
     if trade and account_id in account_data:
-        account_data[account_id]["trades"].insert(0, trade)  # Add to beginning
+        trades = account_data[account_id]["trades"]
+        # Check if trade already exists (by trade_id)
+        trade_id = trade.get("trade_id")
+        if trade_id:
+            # Remove existing trade with same ID to avoid duplicates
+            trades = [t for t in trades if t.get("trade_id") != trade_id]
+        
+        # Add new trade to beginning
+        trades.insert(0, trade)
+        
         # Keep only last 1000 trades
-        if len(account_data[account_id]["trades"]) > 1000:
-            account_data[account_id]["trades"] = account_data[account_id]["trades"][:1000]
+        if len(trades) > 1000:
+            trades = trades[:1000]
+        
+        account_data[account_id]["trades"] = trades
         account_data[account_id]["last_update"] = datetime.now().isoformat()
         await broadcast_update(account_id, "trade", trade)
 
@@ -252,78 +274,212 @@ async def broadcast_update(account_id: str, update_type: str, data: Dict):
 async def update_account_data(account_id: str, conn: DasConnection):
     """Update data for a single account"""
     if not conn.connected:
+        logger.warning(f"[{account_id}] Skipping update - not connected (host: {conn.host}:{conn.port})")
         return
     
+    logger.debug(f"[{account_id}] Starting data update (host: {conn.host}:{conn.port})")
     try:
-        # Run all commands in parallel for faster updates
-        pos_task = conn.send_command("GET POSITIONS")
-        order_task = conn.send_command("GET ORDERS")
-        trade_task = conn.send_command("GET TRADES")
-        acc_task = conn.send_command("GET AccountInfo")
-        bp_task = conn.send_command("GET BP")
+        # Send commands sequentially to avoid response mixing
+        # DasTrader CMD API can mix responses when commands are sent in parallel
+        logger.debug(f"[{account_id}] Sending commands sequentially to avoid response mixing")
         
-        # Wait for all commands to complete
-        pos_data, order_data, trade_data, acc_data, bp_data = await asyncio.gather(
-            pos_task, order_task, trade_task, acc_task, bp_task,
-            return_exceptions=True
-        )
+        # GET POSITIONS
+        logger.debug(f"[{account_id}] Sending GET POSITIONS...")
+        try:
+            pos_data = await conn.send_command("GET POSITIONS")
+            # For slow connections (different IP), wait longer to ensure response is complete
+            delay = 0.3 if conn.host != "127.0.0.1" and conn.host != "localhost" else 0.2
+            await asyncio.sleep(delay)
+            # Validate response contains position data
+            if pos_data:
+                if "%POS" in pos_data or "#POS" in pos_data or pos_data.strip().startswith("#POS"):
+                    logger.debug(f"[{account_id}] GET POSITIONS response validated ({len(pos_data)} chars)")
+                else:
+                    logger.error(f"[{account_id}] GET POSITIONS returned wrong data! Expected positions, got: {pos_data[:300]}")
+                    # Try to identify what we actually got
+                    if "%ORDER" in pos_data or "#Order" in pos_data:
+                        logger.error(f"[{account_id}] Got ORDERS data instead of POSITIONS! Response mixing detected.")
+                    elif "%TRADE" in pos_data or "#Trade" in pos_data:
+                        logger.error(f"[{account_id}] Got TRADES data instead of POSITIONS! Response mixing detected.")
+                    pos_data = None  # Don't process wrong data
+        except Exception as e:
+            logger.error(f"[{account_id}] Error fetching positions: {e}", exc_info=True)
+            pos_data = None
         
-        # Process results
+        # GET ORDERS
+        logger.debug(f"[{account_id}] Sending GET ORDERS...")
+        try:
+            order_data = await conn.send_command("GET ORDERS")
+            # For slow connections (different IP), wait longer to ensure response is complete
+            delay = 0.3 if conn.host != "127.0.0.1" and conn.host != "localhost" else 0.2
+            await asyncio.sleep(delay)
+            # Validate response contains order data
+            if order_data:
+                if "%ORDER" in order_data or "#Order" in order_data or order_data.strip().startswith("#Order"):
+                    logger.debug(f"[{account_id}] GET ORDERS response validated ({len(order_data)} chars)")
+                else:
+                    logger.error(f"[{account_id}] GET ORDERS returned wrong data! Expected orders, got: {order_data[:300]}")
+                    # Try to identify what we actually got
+                    if "%POS" in order_data or "#POS" in order_data:
+                        logger.error(f"[{account_id}] Got POSITIONS data instead of ORDERS! Response mixing detected.")
+                    elif "%TRADE" in order_data or "#Trade" in order_data:
+                        logger.error(f"[{account_id}] Got TRADES data instead of ORDERS! Response mixing detected.")
+                    order_data = None  # Don't process wrong data
+        except Exception as e:
+            logger.error(f"[{account_id}] Error fetching orders: {e}", exc_info=True)
+            order_data = None
+        
+        # GET TRADES
+        logger.debug(f"[{account_id}] Sending GET TRADES...")
+        try:
+            trade_data = await conn.send_command("GET TRADES")
+            # For slow connections (different IP), wait longer to ensure response is complete
+            delay = 0.3 if conn.host != "127.0.0.1" and conn.host != "localhost" else 0.2
+            await asyncio.sleep(delay)
+            # Validate response contains trade data
+            if trade_data:
+                if "%TRADE" in trade_data or "#Trade" in trade_data or trade_data.strip().startswith("#Trade"):
+                    logger.debug(f"[{account_id}] GET TRADES response validated ({len(trade_data)} chars)")
+                else:
+                    logger.error(f"[{account_id}] GET TRADES returned wrong data! Expected trades, got: {trade_data[:300]}")
+                    # Try to identify what we actually got
+                    if "%POS" in trade_data or "#POS" in trade_data:
+                        logger.error(f"[{account_id}] Got POSITIONS data instead of TRADES! Response mixing detected.")
+                    elif "%ORDER" in trade_data or "#Order" in trade_data:
+                        logger.error(f"[{account_id}] Got ORDERS data instead of TRADES! Response mixing detected.")
+                    trade_data = None  # Don't process wrong data
+        except Exception as e:
+            logger.error(f"[{account_id}] Error fetching trades: {e}", exc_info=True)
+            trade_data = None
+        
+        # GET AccountInfo
+        logger.debug(f"[{account_id}] Sending GET AccountInfo...")
+        try:
+            acc_data = await conn.send_command("GET AccountInfo")
+            await asyncio.sleep(0.1)
+        except Exception as e:
+            logger.error(f"[{account_id}] Error fetching account info: {e}")
+            acc_data = None
+        
+        # GET BP
+        logger.debug(f"[{account_id}] Sending GET BP...")
+        try:
+            bp_data = await conn.send_command("GET BP")
+        except Exception as e:
+            logger.error(f"[{account_id}] Error fetching buying power: {e}")
+            bp_data = None
+        
+        logger.debug(f"[{account_id}] All commands completed. Results: pos={type(pos_data).__name__ if pos_data else 'None'}, order={type(order_data).__name__ if order_data else 'None'}, trade={type(trade_data).__name__ if trade_data else 'None'}")
+        
+        # Process results (validation already done above)
         if account_id in account_data:
-            # Process positions
+            # Process positions (only if validated above)
             if pos_data and not isinstance(pos_data, Exception):
+                logger.info(f"[{account_id}] Received positions data: {len(pos_data)} chars, preview: {pos_data[:200]}")
                 positions = data_parser.parse_positions(pos_data)
                 account_data[account_id]["positions"] = positions
+                logger.info(f"[{account_id}] Parsed {len(positions)} positions")
             elif isinstance(pos_data, Exception):
-                logger.error(f"[{account_id}] Error fetching positions: {pos_data}")
+                logger.error(f"[{account_id}] Error fetching positions from {conn.host}:{conn.port}: {pos_data}")
+            elif not pos_data:
+                logger.warning(f"[{account_id}] Empty or invalid positions response from {conn.host}:{conn.port}")
             
-            # Process orders
+            # Process orders (only if validated above)
             if order_data and not isinstance(order_data, Exception):
+                logger.info(f"[{account_id}] Received orders data: {len(order_data)} chars, preview: {order_data[:200]}")
                 orders = data_parser.parse_orders(order_data)
                 account_data[account_id]["orders"] = orders
+                logger.info(f"[{account_id}] Parsed {len(orders)} orders")
             elif isinstance(order_data, Exception):
-                logger.error(f"[{account_id}] Error fetching orders: {order_data}")
+                logger.error(f"[{account_id}] Error fetching orders from {conn.host}:{conn.port}: {order_data}")
+            elif not order_data:
+                logger.warning(f"[{account_id}] Empty or invalid orders response from {conn.host}:{conn.port}")
             
-            # Process trades
+            # Process trades (only if validated above)
             if trade_data and not isinstance(trade_data, Exception):
-                trades = data_parser.parse_trades(trade_data)
-                account_data[account_id]["trades"] = trades
+                logger.info(f"[{account_id}] Received trades data: {len(trade_data)} chars, preview: {trade_data[:200]}")
+                new_trades = data_parser.parse_trades(trade_data)
+                
+                # Merge with existing trades and deduplicate by trade_id
+                existing_trades = account_data[account_id].get("trades", [])
+                existing_trade_ids = {
+                    t.get("trade_id"): t 
+                    for t in existing_trades 
+                    if isinstance(t, dict) and t.get("trade_id")
+                }
+                
+                # Add new trades, updating existing ones
+                for trade in new_trades:
+                    if isinstance(trade, dict):
+                        trade_id = trade.get("trade_id")
+                        if trade_id:
+                            existing_trade_ids[trade_id] = trade
+                
+                # Convert back to list, sorted by time (most recent first)
+                merged_trades = list(existing_trade_ids.values())
+                # Sort by time if available, otherwise keep order
+                try:
+                    merged_trades.sort(key=lambda t: t.get("time", ""), reverse=True)
+                except:
+                    pass
+                
+                # Keep only last 1000 trades
+                if len(merged_trades) > 1000:
+                    merged_trades = merged_trades[:1000]
+                
+                account_data[account_id]["trades"] = merged_trades
+                logger.info(f"[{account_id}] Parsed {len(new_trades)} new trades, total {len(merged_trades)} trades (deduplicated)")
             elif isinstance(trade_data, Exception):
-                logger.error(f"[{account_id}] Error fetching trades: {trade_data}")
+                logger.error(f"[{account_id}] Error fetching trades from {conn.host}:{conn.port}: {trade_data}")
+            elif not trade_data:
+                logger.warning(f"[{account_id}] Empty or invalid trades response from {conn.host}:{conn.port}")
             
             if acc_data and not isinstance(acc_data, Exception):
                 info = data_parser.parse_account_info(acc_data)
                 if info:
                     account_data[account_id]["account_info"] = info
+                    logger.debug(f"[{account_id}] Account info updated")
             
             if bp_data and not isinstance(bp_data, Exception):
                 bp = data_parser.parse_buying_power(bp_data)
                 if bp:
                     account_data[account_id]["buying_power"] = bp
+                    logger.debug(f"[{account_id}] Buying power updated")
             
             account_data[account_id]["last_update"] = datetime.now().isoformat()
+            logger.debug(f"[{account_id}] Data update completed successfully")
     except Exception as e:
-        logger.error(f"Error updating {account_id}: {e}")
+        logger.error(f"[{account_id}] Error updating data from {conn.host}:{conn.port}: {e}", exc_info=True)
 
 
-async def periodic_updates():
-    """Periodic updates for positions, orders, account info"""
-    while True:
-        try:
-            # Update all accounts in parallel for better performance
-            update_tasks = []
-            for account_id, conn in connection_manager.get_all_connections().items():
-                if conn.connected:
-                    update_tasks.append(update_account_data(account_id, conn))
-            
-            # Wait for all updates to complete
-            if update_tasks:
-                await asyncio.gather(*update_tasks, return_exceptions=True)
-            
-            await asyncio.sleep(5)  # Update every 5 seconds
-        except Exception as e:
-            logger.error(f"Error in periodic updates: {e}")
-            await asyncio.sleep(5)
+# Periodic updates disabled - data is refreshed manually via refresh button
+# Real-time updates still work via WebSocket callbacks from DasTrader
+# async def periodic_updates():
+#     """Periodic updates for positions, orders, account info"""
+#     logger.info("Starting periodic updates task")
+#     while True:
+#         try:
+#             # Update all accounts in parallel for better performance
+#             update_tasks = []
+#             connected_accounts = []
+#             for account_id, conn in connection_manager.get_all_connections().items():
+#                 if conn.connected:
+#                     connected_accounts.append(f"{account_id}({conn.host}:{conn.port})")
+#                     update_tasks.append(update_account_data(account_id, conn))
+#                 else:
+#                     logger.debug(f"[{account_id}] Skipping update - not connected to {conn.host}:{conn.port}")
+#             
+#             if update_tasks:
+#                 logger.debug(f"Updating {len(update_tasks)} connected accounts: {', '.join(connected_accounts)}")
+#                 await asyncio.gather(*update_tasks, return_exceptions=True)
+#                 logger.debug("Periodic update cycle completed")
+#             else:
+#                 logger.warning("No connected accounts to update")
+#             
+#             await asyncio.sleep(5)  # Update every 5 seconds
+#         except Exception as e:
+#             logger.error(f"Error in periodic updates: {e}", exc_info=True)
+#             await asyncio.sleep(5)
 
 
 # REST API Endpoints
@@ -464,15 +620,37 @@ async def get_orders(account_id: str, current_user: str = Depends(verify_token))
 @app.get("/api/accounts/{account_id}/trades")
 async def get_trades(account_id: str, limit: int = 100, current_user: str = Depends(verify_token)):
     """Get recent trades for an account"""
+    logger.info(f"GET /api/accounts/{account_id}/trades")
     if account_id not in account_data:
+        logger.warning(f"Account {account_id} not found in account_data")
         raise HTTPException(status_code=404, detail="Account not found")
     
     trades_raw = account_data[account_id].get("trades")
     
     if not trades_raw or not isinstance(trades_raw, list):
+        logger.info(f"[{account_id}] No trades data available, returning empty list")
         return {"account_id": account_id, "trades": []}
     
-    trades = [trade for trade in trades_raw if isinstance(trade, dict)][:limit]
+    # Deduplicate trades by trade_id
+    seen_trade_ids = set()
+    unique_trades = []
+    for trade in trades_raw:
+        if isinstance(trade, dict):
+            trade_id = trade.get("trade_id")
+            if trade_id and trade_id in seen_trade_ids:
+                continue  # Skip duplicate
+            if trade_id:
+                seen_trade_ids.add(trade_id)
+            unique_trades.append(trade)
+    
+    # Sort by time (most recent first) and limit
+    try:
+        unique_trades.sort(key=lambda t: t.get("time", ""), reverse=True)
+    except:
+        pass
+    
+    trades = unique_trades[:limit]
+    logger.info(f"[{account_id}] Returning {len(trades)} trades (deduplicated from {len(trades_raw)} total)")
     return {"account_id": account_id, "trades": trades}
 
 
@@ -528,13 +706,21 @@ async def get_activity(account_id: str, limit: int = 100, current_user: str = De
         raise HTTPException(status_code=404, detail="Account not found")
     
     activities = []
+    seen_trade_ids = set()  # Track seen trade IDs to avoid duplicates
     
     # Add trades
     trades_raw = account_data[account_id].get("trades")
     
     if trades_raw and isinstance(trades_raw, list):
-        for trade in trades_raw[:limit * 2]:  # Get more to sort, then limit
+        for trade in trades_raw:
             if isinstance(trade, dict):
+                trade_id = trade.get("trade_id")
+                # Skip if we've already seen this trade
+                if trade_id and trade_id in seen_trade_ids:
+                    continue
+                if trade_id:
+                    seen_trade_ids.add(trade_id)
+                
                 activities.append({
                     "type": "trade",
                     "timestamp": trade.get("time", ""),
@@ -549,12 +735,14 @@ async def get_activity(account_id: str, limit: int = 100, current_user: str = De
     # Sort by timestamp (most recent first)
     activities.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
     
+    logger.info(f"[{account_id}] Returning {len(activities[:limit])} activities (deduplicated from {len(activities)} total)")
     return {"account_id": account_id, "activities": activities[:limit]}
 
 
 @app.post("/api/accounts/{account_id}/refresh")
 async def refresh_account_data(account_id: str, current_user: str = Depends(verify_token)):
     """Manually refresh account data"""
+    logger.info(f"[{account_id}] Manual refresh requested")
     conn = connection_manager.get_connection(account_id)
     if not conn:
         raise HTTPException(status_code=404, detail="Account not found")
@@ -563,28 +751,12 @@ async def refresh_account_data(account_id: str, current_user: str = Depends(veri
         raise HTTPException(status_code=400, detail="Account not connected")
     
     try:
-        # Refresh all data
-        pos_data = await conn.send_command("GET POSITIONS")
-        order_data = await conn.send_command("GET ORDERS")
-        trade_data = await conn.send_command("GET TRADES")
-        acc_data = await conn.send_command("GET AccountInfo")
-        bp_data = await conn.send_command("GET BP")
-        
-        if account_id in account_data:
-            if pos_data:
-                account_data[account_id]["positions"] = data_parser.parse_positions(pos_data)
-            if order_data:
-                account_data[account_id]["orders"] = data_parser.parse_orders(order_data)
-            if trade_data:
-                account_data[account_id]["trades"] = data_parser.parse_trades(trade_data)
-            if acc_data:
-                account_data[account_id]["account_info"] = data_parser.parse_account_info(acc_data)
-            if bp_data:
-                account_data[account_id]["buying_power"] = data_parser.parse_buying_power(bp_data)
-            account_data[account_id]["last_update"] = datetime.now().isoformat()
-        
+        # Use the same update function to ensure consistency
+        await update_account_data(account_id, conn)
+        logger.info(f"[{account_id}] Manual refresh completed")
         return {"status": "success", "message": "Data refreshed"}
     except Exception as e:
+        logger.error(f"[{account_id}] Error during manual refresh: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
