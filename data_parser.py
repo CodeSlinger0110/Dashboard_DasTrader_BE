@@ -210,13 +210,18 @@ class DataParser:
     def parse_account_info(data: str) -> Optional[Dict]:
         """Parse account info from $AccountInfo response"""
         try:
+            logger.debug(f"Parsing account info data: {len(data)} chars, preview: {data[:200]}")
             # Format: $AccountInfo OpenEQ CurrEQ RealizedPL UnrealizedPL NetPL HTBCost SecFee FINRAFee ECNFee Commission
-            for line in data.split('\n'):
+            # Note: Response may start with header line #ACCOUNTINFO before the actual $AccountInfo line
+            lines = data.split('\n')
+            for line in lines:
                 line = line.strip()
+                # Look for the actual data line (starts with $AccountInfo)
                 if line.startswith("$AccountInfo"):
                     parts = line.split()
+                    logger.debug(f"AccountInfo line has {len(parts)} parts: {line[:200]}")
                     if len(parts) >= 11:
-                        return {
+                        result = {
                             "open_equity": float(parts[1]),
                             "current_equity": float(parts[2]),
                             "realized_pl": float(parts[3]),
@@ -228,25 +233,50 @@ class DataParser:
                             "ecn_fee": float(parts[9]),
                             "commission": float(parts[10])
                         }
+                        logger.info(f"Parsed account info: current_equity={result['current_equity']}, net_pl={result['net_pl']}")
+                        return result
+                    else:
+                        logger.warning(f"AccountInfo line has insufficient parts ({len(parts)} < 11): {line[:200]}")
+            
+            # If we only got the header line, log it
+            if any("#ACCOUNTINFO" in line.upper() for line in lines):
+                logger.warning(f"Got account info header but no data line. Full response: {data[:500]}")
+            else:
+                logger.warning(f"$AccountInfo marker not found in data: {data[:200]}")
         except Exception as e:
-            print(f"Error parsing account info: {e}")
+            logger.error(f"Error parsing account info: {e}", exc_info=True)
         return None
     
     @staticmethod
     def parse_buying_power(data: str) -> Optional[Dict]:
         """Parse buying power from BP response"""
         try:
-            for line in data.split('\n'):
+            logger.debug(f"Parsing buying power data: {len(data)} chars, preview: {data[:200]}")
+            # Note: Response may start with header line #buyingpower before the actual BP line
+            lines = data.split('\n')
+            for line in lines:
                 line = line.strip()
-                if line.startswith("BP"):
+                # Look for the actual data line (starts with BP, not #buyingpower)
+                if line.startswith("BP") and not line.startswith("#"):
                     parts = line.split()
+                    logger.debug(f"BP line has {len(parts)} parts: {line[:200]}")
                     if len(parts) >= 3:
-                        return {
+                        result = {
                             "current_bp": float(parts[1]),
                             "overnight_bp": float(parts[2])
                         }
+                        logger.info(f"Parsed buying power: current_bp={result['current_bp']}, overnight_bp={result['overnight_bp']}")
+                        return result
+                    else:
+                        logger.warning(f"BP line has insufficient parts ({len(parts)} < 3): {line[:200]}")
+            
+            # If we only got the header line, log it
+            if any("#buyingpower" in line.lower() or "#BUYINGPOWER" in line.upper() for line in lines):
+                logger.warning(f"Got buying power header but no data line. Full response: {data[:500]}")
+            else:
+                logger.warning(f"BP marker not found in data: {data[:200]}")
         except Exception as e:
-            print(f"Error parsing buying power: {e}")
+            logger.error(f"Error parsing buying power: {e}", exc_info=True)
         return None
     
     @staticmethod

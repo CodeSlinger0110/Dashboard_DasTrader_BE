@@ -160,7 +160,8 @@ class DasConnection:
         bufsize = 4096
         loop = asyncio.get_event_loop()
         start_time = asyncio.get_event_loop().time()
-        max_wait_time = timeout * 2 if expected_marker else timeout  # Allow more time if waiting for marker
+        max_wait_time = timeout * 3 if expected_marker else timeout  # Allow more time if waiting for marker (3x for slow connections)
+        last_data_time = start_time
         
         try:
             while True:
@@ -171,7 +172,7 @@ class DasConnection:
                 
                 try:
                     # Use shorter timeout per packet to check for marker
-                    packet_timeout = min(0.2, timeout)
+                    packet_timeout = min(0.3, timeout)
                     packet = await asyncio.wait_for(
                         loop.sock_recv(self.socket, bufsize),
                         timeout=packet_timeout
@@ -179,11 +180,21 @@ class DasConnection:
                     if not packet:
                         break
                     data += packet
+                    last_data_time = asyncio.get_event_loop().time()
                     decoded = data.decode("ascii", errors="ignore")
                     
                     # If we're waiting for a specific marker, check if we've received it
                     if expected_marker and expected_marker in decoded:
                         logger.debug(f"[{self.account_id}] Found expected marker '{expected_marker}' in response")
+                        # For AccountInfo and BP, wait a bit more to ensure we got the complete line
+                        if expected_marker in ["$AccountInfo", "BP"]:
+                            await asyncio.sleep(0.1)
+                            try:
+                                additional = await asyncio.wait_for(loop.sock_recv(self.socket, bufsize), timeout=0.2)
+                                if additional:
+                                    data += additional
+                            except:
+                                pass
                         break
                     
                     # If no marker expected and we got a complete response (ends with marker), break
@@ -193,8 +204,18 @@ class DasConnection:
                     # If we have data and no marker expected, return what we have
                     if data and not expected_marker:
                         break
-                    # If waiting for marker and timeout, continue waiting
+                    # If waiting for marker, check if we've received data recently
+                    # If no data for a while and we have some data, might be complete
+                    time_since_data = asyncio.get_event_loop().time() - last_data_time
+                    if expected_marker and time_since_data > 0.5 and data:
+                        # We have data but no marker - might be header only, continue waiting
+                        if expected_marker in ["$AccountInfo", "BP"]:
+                            # For AccountInfo/BP, we might have header, wait a bit more
+                            await asyncio.sleep(0.2)
+                            continue
+                    # If waiting for marker and timeout, continue waiting if we still have time
                     if expected_marker and elapsed < max_wait_time:
+                        await asyncio.sleep(0.1)
                         continue
                     break
         except Exception as e:
@@ -257,22 +278,39 @@ class DasConnection:
                     expected_marker = "%ORDER"
                 elif command == "GET TRADES":
                     expected_marker = "%TRADE"
+                elif command == "GET AccountInfo":
+                    expected_marker = "$AccountInfo"
+                elif command == "GET BP":
+                    expected_marker = "BP"
                 
                 # Use async recv with appropriate timeout for slow connections
                 response = await self.recvall_async(timeout=base_timeout, expected_marker=expected_marker)
                 
                 # Validate response matches command (for slow connections where responses might be delayed)
+                # For AccountInfo and BP, we might get header lines first, so always wait for data line
                 if expected_marker and expected_marker not in response:
-                    logger.warning(f"[{self.account_id}] Command '{command}' response doesn't contain expected marker '{expected_marker}'. Got: {response[:200]}")
-                    # For slow connections, wait a bit more and try to read again
-                    if is_slow_connection:
-                        logger.debug(f"[{self.account_id}] Waiting additional time for slow connection...")
+                    # Check if we got a header line instead of data line
+                    got_header_only = False
+                    if command == "GET AccountInfo" and ("#ACCOUNTINFO" in response.upper() or "#AccountInfo" in response):
+                        got_header_only = True
+                        logger.debug(f"[{self.account_id}] Got AccountInfo header line, waiting for data line...")
+                    elif command == "GET BP" and ("#buyingpower" in response.lower() or "#BUYINGPOWER" in response.upper()):
+                        got_header_only = True
+                        logger.debug(f"[{self.account_id}] Got BP header line, waiting for data line...")
+                    
+                    # Wait for complete response if we got header or it's a slow connection
+                    if got_header_only or is_slow_connection:
+                        logger.debug(f"[{self.account_id}] Waiting additional time for complete response...")
                         await asyncio.sleep(0.5)
-                        additional_data = await self.recvall_async(timeout=1.0)
+                        additional_data = await self.recvall_async(timeout=1.0, expected_marker=expected_marker)
                         if additional_data:
                             response += "\n" + additional_data
                             if expected_marker in response:
-                                logger.debug(f"[{self.account_id}] Found expected marker after additional wait")
+                                logger.debug(f"[{self.account_id}] Found expected marker '{expected_marker}' after additional wait")
+                            else:
+                                logger.warning(f"[{self.account_id}] Still no marker '{expected_marker}' after additional wait. Full response: {response[:500]}")
+                    else:
+                        logger.warning(f"[{self.account_id}] Command '{command}' response doesn't contain expected marker '{expected_marker}'. Got: {response[:200]}")
                 
                 logger.debug(f"[{self.account_id}] Command '{command}' response received ({len(response)} chars): {response[:200]}")
                 

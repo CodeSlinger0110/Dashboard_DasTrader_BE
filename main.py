@@ -356,17 +356,21 @@ async def update_account_data(account_id: str, conn: DasConnection):
         logger.debug(f"[{account_id}] Sending GET AccountInfo...")
         try:
             acc_data = await conn.send_command("GET AccountInfo")
-            await asyncio.sleep(0.1)
+            # For slow connections (different IP), wait longer to ensure response is complete
+            delay = 0.3 if conn.host != "127.0.0.1" and conn.host != "localhost" else 0.1
+            await asyncio.sleep(delay)
+            logger.debug(f"[{account_id}] GET AccountInfo response: {acc_data[:200] if acc_data else 'None'}")
         except Exception as e:
-            logger.error(f"[{account_id}] Error fetching account info: {e}")
+            logger.error(f"[{account_id}] Error fetching account info: {e}", exc_info=True)
             acc_data = None
         
         # GET BP
         logger.debug(f"[{account_id}] Sending GET BP...")
         try:
             bp_data = await conn.send_command("GET BP")
+            logger.debug(f"[{account_id}] GET BP response: {bp_data[:200] if bp_data else 'None'}")
         except Exception as e:
-            logger.error(f"[{account_id}] Error fetching buying power: {e}")
+            logger.error(f"[{account_id}] Error fetching buying power: {e}", exc_info=True)
             bp_data = None
         
         logger.debug(f"[{account_id}] All commands completed. Results: pos={type(pos_data).__name__ if pos_data else 'None'}, order={type(order_data).__name__ if order_data else 'None'}, trade={type(trade_data).__name__ if trade_data else 'None'}")
@@ -435,16 +439,30 @@ async def update_account_data(account_id: str, conn: DasConnection):
                 logger.warning(f"[{account_id}] Empty or invalid trades response from {conn.host}:{conn.port}")
             
             if acc_data and not isinstance(acc_data, Exception):
+                logger.info(f"[{account_id}] Received account info data: {len(acc_data)} chars, preview: {acc_data[:200]}")
                 info = data_parser.parse_account_info(acc_data)
                 if info:
                     account_data[account_id]["account_info"] = info
-                    logger.debug(f"[{account_id}] Account info updated")
+                    logger.info(f"[{account_id}] Account info updated: {info}")
+                else:
+                    logger.warning(f"[{account_id}] Failed to parse account info from: {acc_data[:200]}")
+            elif isinstance(acc_data, Exception):
+                logger.error(f"[{account_id}] Error fetching account info from {conn.host}:{conn.port}: {acc_data}")
+            elif not acc_data:
+                logger.warning(f"[{account_id}] Empty account info response from {conn.host}:{conn.port}")
             
             if bp_data and not isinstance(bp_data, Exception):
+                logger.info(f"[{account_id}] Received buying power data: {len(bp_data)} chars, preview: {bp_data[:200]}")
                 bp = data_parser.parse_buying_power(bp_data)
                 if bp:
                     account_data[account_id]["buying_power"] = bp
-                    logger.debug(f"[{account_id}] Buying power updated")
+                    logger.info(f"[{account_id}] Buying power updated: {bp}")
+                else:
+                    logger.warning(f"[{account_id}] Failed to parse buying power from: {bp_data[:200]}")
+            elif isinstance(bp_data, Exception):
+                logger.error(f"[{account_id}] Error fetching buying power from {conn.host}:{conn.port}: {bp_data}")
+            elif not bp_data:
+                logger.warning(f"[{account_id}] Empty buying power response from {conn.host}:{conn.port}")
             
             account_data[account_id]["last_update"] = datetime.now().isoformat()
             logger.debug(f"[{account_id}] Data update completed successfully")
@@ -657,21 +675,52 @@ async def get_trades(account_id: str, limit: int = 100, current_user: str = Depe
 @app.get("/api/accounts/{account_id}/overview")
 async def get_account_overview(account_id: str, current_user: str = Depends(verify_token)):
     """Get account overview (equity, margin, cash, etc.)"""
+    logger.info(f"GET /api/accounts/{account_id}/overview")
     if account_id not in account_data:
+        logger.warning(f"Account {account_id} not found in account_data")
         raise HTTPException(status_code=404, detail="Account not found")
     
     data = account_data[account_id]
     # Handle None values - if account_info or buying_power is None, use empty dict
     account_info = data.get("account_info") or {}
     buying_power = data.get("buying_power") or {}
-    positions = data.get("positions", [])
+    positions_raw = data.get("positions", [])
     
-    # Calculate total unrealized PnL
-    total_unrealized = sum(p.get("unrealized_pnl", 0) for p in positions if isinstance(p, dict))
+    # Filter positions with quantity > 0 and ensure they're dictionaries
+    positions = [p for p in positions_raw if isinstance(p, dict) and p.get("quantity", 0) != 0]
+    
+    # Get quotes for mark price calculation
+    quotes = data.get("quotes", {})
+    
+    # Calculate unrealized PnL for each position and total
+    total_unrealized = 0
+    for pos in positions:
+        if not isinstance(pos, dict):
+            continue
+        symbol = pos.get("symbol")
+        quantity = pos.get("quantity", 0)
+        avg_cost = pos.get("avg_cost", 0)
+        
+        # Get mark price from quote or use avg_cost
+        mark_price = pos.get("mark_price") or avg_cost
+        if symbol and symbol in quotes:
+            quote = quotes[symbol]
+            if isinstance(quote, dict):
+                mark_price = quote.get("l", mark_price)  # Use last price from quote
+        
+        # Calculate unrealized PnL
+        if pos.get("type") == "short":
+            unrealized = (avg_cost - mark_price) * quantity
+        else:
+            unrealized = (mark_price - avg_cost) * quantity
+        
+        pos["unrealized_pnl"] = unrealized
+        pos["mark_price"] = mark_price
+        total_unrealized += unrealized
     
     # Calculate exposure by asset class (simplified - all equities for now)
     equity_exposure = sum(
-        abs(p.get("quantity", 0) * p.get("mark_price", p.get("avg_cost", 0))) 
+        abs(p.get("quantity", 0) * (p.get("mark_price") or p.get("avg_cost", 0))) 
         for p in positions 
         if isinstance(p, dict)
     )
@@ -681,7 +730,11 @@ async def get_account_overview(account_id: str, current_user: str = Depends(veri
     finra_fee = account_info.get("finra_fee", 0) if isinstance(account_info, dict) else 0
     ecn_fee = account_info.get("ecn_fee", 0) if isinstance(account_info, dict) else 0
     
-    return {
+    # Log overview data for debugging
+    logger.debug(f"[{account_id}] Overview - account_info: {account_info}, buying_power: {buying_power}")
+    logger.debug(f"[{account_id}] Overview - positions: {len(positions)}, total_unrealized: {total_unrealized}, equity_exposure: {equity_exposure}")
+    
+    result = {
         "account_id": account_id,
         "user_id": data.get("user_id"),
         "user_name": data.get("user_name"),
@@ -697,6 +750,9 @@ async def get_account_overview(account_id: str, current_user: str = Depends(veri
         "fees": sec_fee + finra_fee + ecn_fee,
         "last_update": data.get("last_update")
     }
+    
+    logger.info(f"[{account_id}] Returning overview: equity={result['current_equity']}, bp={result['buying_power']}, unrealized_pl={result['unrealized_pl']}")
+    return result
 
 
 @app.get("/api/accounts/{account_id}/activity")
