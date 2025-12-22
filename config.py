@@ -3,6 +3,7 @@ Configuration file for DasTrader accounts
 Add your account details here
 One user can have multiple accounts
 """
+from tkinter import FALSE
 from typing import List, Dict
 from pydantic import BaseModel
 
@@ -23,7 +24,6 @@ class UserConfig(BaseModel):
 
 # Configure users and their accounts here
 # Each user can have multiple accounts
-# CB4507 - Hayden
 USERS: List[UserConfig] = [
     UserConfig(
         user_id="CB4507",
@@ -140,4 +140,6 @@ AUTH_CREDENTIALS = {
 JWT_SECRET_KEY = "your-secret-key-change-this-in-production"
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = 24
+
+
 

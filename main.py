@@ -11,15 +11,25 @@ from contextlib import asynccontextmanager
 import asyncio
 import json
 import logging
+import os
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
+from twilio.rest import Client as TwilioClient
 
 try:
-    from .config import ACCOUNTS, ACCOUNTS_DICT, USERS, AUTH_CREDENTIALS, JWT_SECRET_KEY, JWT_ALGORITHM, JWT_EXPIRATION_HOURS
+    from .config import (
+        ACCOUNTS, ACCOUNTS_DICT, USERS, AUTH_CREDENTIALS, 
+        JWT_SECRET_KEY, JWT_ALGORITHM, JWT_EXPIRATION_HOURS,
+        TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_FROM, TWILIO_WHATSAPP_TO, TWILIO_CONTENT_SID
+    )
     from .das_connection import ConnectionManager, DasConnection
     from .data_parser import DataParser
 except ImportError:
-    from config import ACCOUNTS, ACCOUNTS_DICT, USERS, AUTH_CREDENTIALS, JWT_SECRET_KEY, JWT_ALGORITHM, JWT_EXPIRATION_HOURS
+    from config import (
+        ACCOUNTS, ACCOUNTS_DICT, USERS, AUTH_CREDENTIALS, 
+        JWT_SECRET_KEY, JWT_ALGORITHM, JWT_EXPIRATION_HOURS,
+        TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_FROM, TWILIO_WHATSAPP_TO, TWILIO_CONTENT_SID
+    )
     from das_connection import ConnectionManager, DasConnection
     from data_parser import DataParser
 
@@ -540,6 +550,164 @@ async def login(login_data: LoginRequest):
 async def verify_auth(current_user: str = Depends(verify_token)):
     """Verify token endpoint"""
     return {"username": current_user, "valid": True}
+
+# Webhook endpoint for DAS signals (public, no authentication required)
+class DasSignalRequest(BaseModel):
+    source: str
+    symbol: str
+    price: str
+    shares: str
+    alert: str
+
+def send_whatsapp_message(message: str = "", use_template: bool = False, template_variables: dict = None) -> bool:
+    """
+    Send WhatsApp message via Twilio to multiple recipients
+    
+    Args:
+        message: Plain text message (used if use_template=False)
+        use_template: If True, use content template instead of plain text
+        template_variables: Variables for content template (dict or JSON string)
+    
+    Returns:
+        True if at least one message was sent successfully, False otherwise
+    """
+    try:
+        # Get Twilio credentials from environment variables or config
+        account_sid = os.getenv("TWILIO_ACCOUNT_SID", TWILIO_ACCOUNT_SID)
+        auth_token = os.getenv("TWILIO_AUTH_TOKEN", TWILIO_AUTH_TOKEN)
+        from_number = os.getenv("TWILIO_WHATSAPP_FROM", TWILIO_WHATSAPP_FROM)
+        to_numbers_env = os.getenv("TWILIO_WHATSAPP_TO", None)
+        to_numbers_config = TWILIO_WHATSAPP_TO
+        content_sid = os.getenv("TWILIO_CONTENT_SID", TWILIO_CONTENT_SID)
+        
+        # Check if Twilio is configured
+        if not account_sid or not auth_token:
+            logger.warning("Twilio not configured. Please set TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN.")
+            return False
+        
+        # Parse recipient numbers - handle both string and list formats
+        if to_numbers_env:
+            # Environment variable takes precedence
+            # Try to parse as JSON array first, then as comma-separated string
+            try:
+                to_numbers = json.loads(to_numbers_env)
+                if isinstance(to_numbers, str):
+                    to_numbers = [to_numbers]
+            except (json.JSONDecodeError, TypeError):
+                # If not JSON, treat as comma-separated string
+                to_numbers = [num.strip() for num in to_numbers_env.split(",")]
+        else:
+            # Use config value
+            if isinstance(to_numbers_config, str):
+                to_numbers = [to_numbers_config]
+            elif isinstance(to_numbers_config, list):
+                to_numbers = to_numbers_config
+            else:
+                logger.error(f"Invalid TWILIO_WHATSAPP_TO format: {type(to_numbers_config)}")
+                return False
+        
+        # Ensure we have at least one recipient
+        if not to_numbers or len(to_numbers) == 0:
+            logger.warning("No WhatsApp recipients configured.")
+            return False
+        
+        # Initialize Twilio client
+        client = TwilioClient(account_sid, auth_token)
+        
+        # Track success
+        success_count = 0
+        failed_count = 0
+        
+        # Send WhatsApp message to each recipient
+        for to_number in to_numbers:
+            try:
+                if use_template and content_sid:
+                    # Use content template
+                    content_vars = template_variables if template_variables else {}
+                    if isinstance(content_vars, dict):
+                        content_vars = json.dumps(content_vars)
+                    
+                    message_obj = client.messages.create(
+                        from_=from_number,
+                        content_sid=content_sid,
+                        content_variables=content_vars,
+                        to=to_number
+                    )
+                    logger.info(f"WhatsApp template message sent to {to_number} successfully. SID: {message_obj.sid}")
+                    success_count += 1
+                else:
+                    # Send plain text message
+                    message_obj = client.messages.create(
+                        body=message,
+                        from_=from_number,
+                        to=to_number
+                    )
+                    logger.info(f"WhatsApp text message sent to {to_number} successfully. SID: {message_obj.sid}")
+                    success_count += 1
+            except Exception as e:
+                logger.error(f"Error sending WhatsApp message to {to_number}: {e}", exc_info=True)
+                failed_count += 1
+        
+        # Return True if at least one message was sent successfully
+        if success_count > 0:
+            logger.info(f"WhatsApp messages sent: {success_count} successful, {failed_count} failed")
+            return True
+        else:
+            logger.error(f"Failed to send WhatsApp messages to all recipients ({failed_count} failed)")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error sending WhatsApp message: {e}", exc_info=True)
+        return False
+
+@app.post("/webhook/das")
+async def receive_das_signal(signal: DasSignalRequest):
+    """
+    Public webhook endpoint to receive DAS trading signals
+    No authentication required - this is called by external scripts
+    """
+    try:
+        logger.info(f"Received DAS signal: {signal.symbol} @ {signal.price}, {signal.shares} shares, alert: {signal.alert}")
+        
+        # Format WhatsApp message (plain text)
+        message = f"🚨 DAS Trading Alert 🚨\n\n"
+        message += f"Symbol: {signal.symbol}\n"
+        message += f"Price: ${signal.price}\n"
+        message += f"Shares: {signal.shares}\n"
+        message += f"Alert Type: {signal.alert}\n"
+        message += f"Source: {signal.source}\n"
+        message += f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        
+        success = send_whatsapp_message(message)
+        
+        if success:
+            return {
+                "status": "success",
+                "message": "Signal received and WhatsApp notification sent",
+                "data": {
+                    "symbol": signal.symbol,
+                    "price": signal.price,
+                    "shares": signal.shares,
+                    "alert": signal.alert
+                }
+            }
+        else:
+            return {
+                "status": "partial_success",
+                "message": "Signal received but WhatsApp notification failed",
+                "data": {
+                    "symbol": signal.symbol,
+                    "price": signal.price,
+                    "shares": signal.shares,
+                    "alert": signal.alert
+                }
+            }
+    except Exception as e:
+        logger.error(f"Error processing DAS signal: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error processing signal: {str(e)}"
+        )
 
 @app.get("/api/accounts")
 async def get_accounts(current_user: str = Depends(verify_token)):
